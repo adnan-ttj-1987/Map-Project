@@ -6,17 +6,12 @@
 # Usage: pip install -r requirements.txt
 # ============================================================================
 
-# Core Streamlit Framework
-streamlit==1.28.1
-
-# Folium for interactive maps
-folium==0.14.0
-
-# Streamlit integration for Folium
-streamlit-folium==0.7.0
-
-# Geocoding support for location search
-geopy==2.4.0
+# Python 3.14-compatible runtime dependencies
+streamlit>=1.56,<2
+folium>=0.20,<1
+streamlit-folium>=0.27,<1
+geopy>=2.4,<3
+requests>=2.32,<3
 
 # ============================================================================
 # Optional Dependencies (Uncomment if needed)
@@ -31,7 +26,7 @@ geopy==2.4.0
 
 # ============================================================================
 # Installation Instructions:
-# 1. Activate virtual environment: venv\Scripts\activate
+# 1. Create or activate virtual environment: .venv\Scripts\activate
 # 2. Install dependencies: pip install -r requirements.txt
 # 3. Run application: streamlit run app.py
 # ============================================================================

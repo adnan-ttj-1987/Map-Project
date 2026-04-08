@@ -22,12 +22,76 @@
 #
 # ============================================================================
 
+import json
+import os
 import requests
 from math import radians, cos, sin, asin, sqrt
 import streamlit as st
+import time
 
 # Overpass API endpoint
 OVERPASS_API = "https://overpass-api.de/api/interpreter"
+OVERPASS_TIMEOUT_SECONDS = 20
+OVERPASS_MAX_RETRIES = 3
+OVERPASS_INITIAL_BACKOFF_SECONDS = 0.4
+NEARBY_CACHE_TTL_SECONDS = 120
+_NEARBY_CACHE = {}
+PERSISTENT_NEARBY_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+_PERSISTENT_CACHE_LOADED = False
+_PERSISTENT_CACHE = {}
+_PERSISTENT_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "data", "nearby_cache.json"
+)
+
+
+def clear_nearby_cache() -> None:
+    global _NEARBY_CACHE, _PERSISTENT_CACHE, _PERSISTENT_CACHE_LOADED
+    _NEARBY_CACHE = {}
+    _PERSISTENT_CACHE = {}
+    _PERSISTENT_CACHE_LOADED = True
+    try:
+        if os.path.exists(_PERSISTENT_CACHE_FILE):
+            os.remove(_PERSISTENT_CACHE_FILE)
+    except Exception as exc:
+        print(f"[WARN] Failed to clear nearby cache file: {str(exc)}")
+
+
+def get_nearby_cache_stats() -> dict:
+    _load_persistent_cache()
+    file_exists = os.path.exists(_PERSISTENT_CACHE_FILE)
+    file_size = os.path.getsize(_PERSISTENT_CACHE_FILE) if file_exists else 0
+    return {
+        "memory_entries": len(_NEARBY_CACHE),
+        "persistent_entries": len(_PERSISTENT_CACHE),
+        "file_exists": file_exists,
+        "file_size_bytes": file_size,
+    }
+
+
+def _load_persistent_cache() -> None:
+    global _PERSISTENT_CACHE_LOADED, _PERSISTENT_CACHE
+    if _PERSISTENT_CACHE_LOADED:
+        return
+
+    try:
+        if os.path.exists(_PERSISTENT_CACHE_FILE):
+            with open(_PERSISTENT_CACHE_FILE, "r", encoding="utf-8") as cache_file:
+                loaded = json.load(cache_file)
+                if isinstance(loaded, dict):
+                    _PERSISTENT_CACHE = loaded
+    except Exception as exc:
+        print(f"[WARN] Failed to load persistent nearby cache: {str(exc)}")
+
+    _PERSISTENT_CACHE_LOADED = True
+
+
+def _save_persistent_cache() -> None:
+    try:
+        os.makedirs(os.path.dirname(_PERSISTENT_CACHE_FILE), exist_ok=True)
+        with open(_PERSISTENT_CACHE_FILE, "w", encoding="utf-8") as cache_file:
+            json.dump(_PERSISTENT_CACHE, cache_file)
+    except Exception as exc:
+        print(f"[WARN] Failed to save persistent nearby cache: {str(exc)}")
 
 # Category definitions with OSM tags
 PLACE_CATEGORIES = {
@@ -98,6 +162,28 @@ def query_overpass(lat, lon, radius_km=1.0):
     Uses a simplified query format
     """
     try:
+        _load_persistent_cache()
+
+        cache_key = (round(lat, 5), round(lon, 5), round(radius_km, 2))
+        persistent_key = f"{cache_key[0]}|{cache_key[1]}|{cache_key[2]}"
+        now = time.time()
+
+        # Fast in-memory cache
+        cached = _NEARBY_CACHE.get(cache_key)
+        if cached and (now - cached["ts"] <= NEARBY_CACHE_TTL_SECONDS):
+            return list(cached["places"])
+
+        # Persistent local cache (hash-like key stored in JSON)
+        persistent_cached = _PERSISTENT_CACHE.get(persistent_key)
+        if (
+            persistent_cached
+            and isinstance(persistent_cached, dict)
+            and (now - persistent_cached.get("ts", 0) <= PERSISTENT_NEARBY_CACHE_TTL_SECONDS)
+        ):
+            places = list(persistent_cached.get("places", []))
+            _NEARBY_CACHE[cache_key] = {"ts": now, "places": places}
+            return places
+
         # Convert radius_km to bbox_delta (rough approximation: 1km ≈ 0.009 degrees)
         bbox_delta = (radius_km / 111.0)  # More accurate conversion
         
@@ -120,55 +206,65 @@ out center;
         print(f"[DEBUG] Querying Overpass API for location: {lat}, {lon}")
         print(f"[DEBUG] Query bbox: {lat-bbox_delta},{lon-bbox_delta},{lat+bbox_delta},{lon+bbox_delta}")
         
-        response = requests.post(OVERPASS_API, data=simple_query, timeout=20)
-        
-        print(f"[DEBUG] Response status: {response.status_code}")
-        
-        if response.status_code == 200:
+        backoff = OVERPASS_INITIAL_BACKOFF_SECONDS
+        for attempt in range(OVERPASS_MAX_RETRIES):
             try:
+                response = requests.post(OVERPASS_API, data=simple_query, timeout=OVERPASS_TIMEOUT_SECONDS)
+
+                print(f"[DEBUG] Response status: {response.status_code} (attempt {attempt + 1})")
+
+                if response.status_code != 200:
+                    print(f"[ERROR] Overpass API returned status {response.status_code}")
+                    print(f"[DEBUG] Response: {response.text[:200]}")
+                    if attempt < OVERPASS_MAX_RETRIES - 1:
+                        time.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    return []
+
                 data = response.json()
                 print(f"[DEBUG] Response received, parsing elements...")
-                
+
                 places = []
                 elements = data.get("elements", [])
                 print(f"[DEBUG] Found {len(elements)} elements in response")
-                
+
                 for element in elements:
                     tags = element.get("tags", {})
                     name = tags.get("name", "")
-                    
+
                     # Skip unnamed places
                     if not name or name == "Unnamed":
                         continue
-                    
+
                     # Get coordinates
                     place_lat = None
                     place_lon = None
-                    
+
                     if "lat" in element and "lon" in element:
                         place_lat = element["lat"]
                         place_lon = element["lon"]
                     elif "center" in element:
                         place_lat = element["center"].get("lat")
                         place_lon = element["center"].get("lon")
-                    
+
                     if not place_lat or not place_lon:
                         continue
-                    
+
                     # Calculate distance
                     distance = haversine(lon, lat, place_lon, place_lat)
-                    
+
                     # Skip if too far (>1.5km)
                     if distance > 1.5:
                         continue
-                    
+
                     # Categorize
                     category = categorize_place(tags)
                     if category:
                         halal_status = None
                         if "Food" in category:
                             halal_status = is_halal(tags)
-                        
+
                         # Extract rating information
                         rating = None
                         try:
@@ -177,7 +273,7 @@ out center;
                                 rating = float(rating_str)
                         except (ValueError, TypeError):
                             rating = None
-                        
+
                         places.append({
                             "name": name,
                             "category": category,
@@ -190,17 +286,32 @@ out center;
                             "phone": tags.get("phone", ""),
                             "rating": rating
                         })
-                
+
+                # If an attempt returns empty, retry before concluding no places.
+                if not places and attempt < OVERPASS_MAX_RETRIES - 1:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+
                 print(f"[DEBUG] Successfully processed {len(places)} places")
+                _NEARBY_CACHE[cache_key] = {"ts": now, "places": list(places)}
+                _PERSISTENT_CACHE[persistent_key] = {"ts": now, "places": list(places)}
+                _save_persistent_cache()
                 return places
-            except Exception as json_err:
-                print(f"[ERROR] Failed to parse JSON response: {str(json_err)}")
-                print(f"[DEBUG] Response text: {response.text[:500]}")
+            except requests.exceptions.Timeout:
+                print(f"[ERROR] Overpass API request timed out (attempt {attempt + 1})")
+                if attempt < OVERPASS_MAX_RETRIES - 1:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
                 return []
-        else:
-            print(f"[ERROR] Overpass API returned status {response.status_code}")
-            print(f"[DEBUG] Response: {response.text[:200]}")
-            return []
+            except Exception as json_err:
+                print(f"[ERROR] Failed to parse/process Overpass response: {str(json_err)}")
+                if attempt < OVERPASS_MAX_RETRIES - 1:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return []
             
     except requests.exceptions.Timeout:
         print(f"[ERROR] Overpass API request timed out")
